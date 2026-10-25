@@ -1,0 +1,72 @@
+name: Antreizh - Collecte meteo
+
+# GitHub lance la collecte. Les identifiants Meteo-France restent exclusivement
+# dans meteo-secrets.php sur IONOS ; rien de confidentiel n'est stocke ici.
+on:
+  schedule:
+    # Toutes les 10 min, decalage pour eviter le pic en debut d'heure (UTC).
+    - cron: '7,17,27,37,47,57 * * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+# Evite des appels simultanes au PHP si une execution prend du retard.
+concurrency:
+  group: antreizh-collecte-meteo
+  cancel-in-progress: false
+
+jobs:
+  collecte:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - name: Executer la collecte sur IONOS
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Le PHP v12 publie wind-snapshot.json s'il dispose de mesures valides.
+          curl \
+            --fail \
+            --show-error \
+            --silent \
+            --connect-timeout 10 \
+            --max-time 110 \
+            --retry 1 \
+            --retry-delay 4 \
+            --output /dev/null \
+            'https://www.antreizh.fr/widgets/vent/wind-data.php'
+          echo 'Appel de wind-data.php termine.'
+
+      - name: Controler la publication du JSON
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import datetime as dt
+          import json
+          import urllib.request
+
+          now = dt.datetime.now(dt.timezone.utc)
+          url = 'https://www.antreizh.fr/widgets/vent/wind-snapshot.json'
+          req = urllib.request.Request(
+              url + '?verif=' + str(int(now.timestamp())),
+              headers={'Accept': 'application/json', 'User-Agent': 'Antreizh-GitHub-Actions/1.0'},
+          )
+          with urllib.request.urlopen(req, timeout=20) as response:
+              snapshot = json.load(response)
+
+          stations = snapshot.get('stations', [])
+          if not isinstance(stations, list) or {s.get('slug') for s in stations} != {'lanveoc', 'saint-segal'}:
+              raise SystemExit('ERREUR : stations absentes ou incompletes dans wind-snapshot.json')
+
+          published = snapshot.get('published_at')
+          if not published:
+              raise SystemExit('ERREUR : published_at absent de wind-snapshot.json')
+          stamp = dt.datetime.fromisoformat(published.replace('Z', '+00:00'))
+          if stamp.tzinfo is None:
+              raise SystemExit('ERREUR : published_at ne comporte pas de fuseau horaire')
+          age = (dt.datetime.now(dt.timezone.utc) - stamp).total_seconds() / 60
+          print(f'Instantane publie : {published} ; age : {age:.1f} min')
+          if age < -5 or age > 45:
+              raise SystemExit('ERREUR : instantane trop ancien ou horodatage incoherent')
+          print('OK : instantane des deux stations disponible.')
+          PY
